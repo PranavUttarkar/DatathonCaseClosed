@@ -96,14 +96,151 @@ def send_move():
         boosts_remaining = my_agent.boosts_remaining
    
     # -----------------your code here-------------------
-    # Simple example: always go RIGHT (replace this with your logic)
-    # To use a boost: move = "RIGHT:BOOST"
-    move = "RIGHT"
-    
-    # Example: Use boost if available and it's late in the game
-    # turn_count = state.get("turn_count", 0)
-    # if boosts_remaining > 0 and turn_count > 50:
-    #     move = "RIGHT:BOOST"
+    # Heuristic pathfinding agent:
+    # - Avoid immediate collisions (including with our own trail)
+    # - Prefer moves that maximize reachable empty space (flood fill)
+    # - Avoid reversing direction (judge will also fix this, but we pre-filter)
+    # - Consider using BOOST only when it increases safe reachable space and doesn't collide
+
+    from collections import deque
+
+    board = state.get("board")
+    my_trail = state.get("agent1_trail", []) if player_number == 1 else state.get("agent2_trail", [])
+    opp_trail = state.get("agent2_trail", []) if player_number == 1 else state.get("agent1_trail", [])
+
+    if not board or not my_trail:
+        return jsonify({"move": "RIGHT"}), 200
+
+    height = len(board)
+    width = len(board[0]) if height > 0 else 0
+
+    # Direction helpers
+    DIRS = {
+        "UP": (0, -1),
+        "DOWN": (0, 1),
+        "LEFT": (-1, 0),
+        "RIGHT": (1, 0),
+    }
+    OPPOSITE = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+
+    def norm(x, y):
+        return (x % width, y % height)
+
+    def cell_empty(x, y, grid):
+        nx, ny = norm(x, y)
+        try:
+            return grid[ny][nx] == 0
+        except Exception:
+            return False
+
+    # Compute current direction from last 2 trail positions (torus-aware)
+    def current_direction(trail):
+        if len(trail) < 2:
+            return "RIGHT"
+        (x2, y2) = trail[-1]
+        (x1, y1) = trail[-2]
+        dx = x2 - x1
+        dy = y2 - y1
+        # Adjust for torus wrapping: choose the step with |d| <= 1
+        if dx > 1:
+            dx = dx - width
+        if dx < -1:
+            dx = dx + width
+        if dy > 1:
+            dy = dy - height
+        if dy < -1:
+            dy = dy + height
+        if (dx, dy) == (1, 0):
+            return "RIGHT"
+        if (dx, dy) == (-1, 0):
+            return "LEFT"
+        if (dx, dy) == (0, 1):
+            return "DOWN"
+        if (dx, dy) == (0, -1):
+            return "UP"
+        return "RIGHT"
+
+    # Flood-fill reachable area from a start on a given grid
+    def reachable_area(start_xy, grid):
+        sx, sy = norm(start_xy[0], start_xy[1])
+        if not cell_empty(sx, sy, grid):
+            return 0
+        seen = set()
+        q = deque()
+        q.append((sx, sy))
+        seen.add((sx, sy))
+        count = 0
+        while q:
+            x, y = q.popleft()
+            count += 1
+            for dx, dy in DIRS.values():
+                nx, ny = norm(x + dx, y + dy)
+                if (nx, ny) not in seen and cell_empty(nx, ny, grid):
+                    seen.add((nx, ny))
+                    q.append((nx, ny))
+        return count
+
+    # Score a move by simulating our immediate occupancy and measuring reachable area
+    def score_move(dir_name, use_boost_flag):
+        dx, dy = DIRS[dir_name]
+        head_x, head_y = my_trail[-1]
+        # First step
+        n1x, n1y = norm(head_x + dx, head_y + dy)
+        if not cell_empty(n1x, n1y, board):
+            return -1_000_000  # death
+        # Copy and mark first step as occupied
+        g = [row[:] for row in board]
+        g[n1y][n1x] = 1
+        # If boosting, second step in same dir
+        if use_boost_flag:
+            n2x, n2y = norm(n1x + dx, n1y + dy)
+            if not cell_empty(n2x, n2y, g):
+                return -900_000  # death on boost second step
+            g[n2y][n2x] = 1
+            start = (n2x, n2y)
+        else:
+            start = (n1x, n1y)
+
+        # Primary metric: our reachable empty space after this move
+        area = reachable_area(start, g)
+
+        # Secondary: prefer staying farther from opponent head to reduce head-on risks
+        opp_head = tuple(opp_trail[-1]) if opp_trail else None
+        if opp_head:
+            ox, oy = opp_head
+            # Manhattan distance with torus wrap
+            dxwrap = min((start[0] - ox) % width, (ox - start[0]) % width)
+            dywrap = min((start[1] - oy) % height, (oy - start[1]) % height)
+            dist = dxwrap + dywrap
+        else:
+            dist = 0
+
+        # Slightly reward continuing straight to avoid jitter
+        straight_bonus = 3 if dir_name == cur_dir else 0
+
+        # Slightly penalize using boost unless it clearly helps area
+        boost_penalty = -2 if use_boost_flag else 0
+
+        return area * 10 + dist * 2 + straight_bonus + boost_penalty
+
+    cur_dir = current_direction(my_trail)
+    candidate_dirs = [d for d in DIRS.keys() if d != OPPOSITE.get(cur_dir, "")]  # avoid reversing
+
+    # Evaluate no-boost options first
+    best = ("RIGHT", False, -1_000_000)
+    for dname in candidate_dirs:
+        s = score_move(dname, use_boost_flag=False)
+        if s > best[2]:
+            best = (dname, False, s)
+
+    # Consider boost if available; only keep if strictly better than non-boost
+    if boosts_remaining > 0:
+        for dname in candidate_dirs:
+            s = score_move(dname, use_boost_flag=True)
+            if s > best[2] + 15:  # require clear improvement to justify boost
+                best = (dname, True, s)
+
+    move = best[0] + (":BOOST" if best[1] else "")
     # -----------------end code here--------------------
 
     return jsonify({"move": move}), 200
