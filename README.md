@@ -13,6 +13,60 @@ This template provides a few key files to get you started. Here's what each one 
 *   Look for the `send_move` function. Inside, you will find a section marked with comments: `# --- YOUR CODE GOES HERE ---`. This is where you should add your code to decide which move to make based on the current game state.
 *   Your agent can return moves in the format `"DIRECTION"` (e.g., `"UP"`, `"DOWN"`, `"LEFT"`, `"RIGHT"`) or `"DIRECTION:BOOST"` (e.g., `"UP:BOOST"`) to use a speed boost.
 
+## Our Agent Strategy (Hamiltonian + Flood-Fill Heuristic)
+
+This repository’s `agent.py` implements a modular, high-coverage strategy that combines a Hamiltonian serpentine cycle with a safety-first heuristic fallback. The goal is to systematically traverse the board and fill as many cells as possible while minimizing crash risk and head-on collisions.
+
+### Key Ideas
+- Hamiltonian serpentine cycle: A precomputed path that visits every cell exactly once in a snaking pattern across rows. If the next cell on this cycle is available and not the opposite of our current direction, we follow it. This tends to maximize coverage and keep our trail orderly.
+- Flood-fill fallback: When the cycle is blocked or following it would be risky, we evaluate the remaining safe directions using a scoring function based on reachable empty area after the move, distance from the opponent’s head, a bonus for continuing straight (to avoid jitter), and a cycle-continuity bonus.
+- Selective boost usage: We only use a BOOST if it safely and clearly increases our score beyond a threshold; otherwise, we conserve boosts.
+
+### Components at a Glance
+- Torus normalization: All coordinates wrap around the edges (`width` and `height`).
+- Direction inference: We infer current direction from the last two trail positions accounting for wrap.
+- Hamiltonian successor map: For each cell, compute its “next” neighbor in a serpentine cycle.
+- Reachable-area estimator: A fast BFS (flood fill) to count empty cells reachable after a candidate move.
+- Scoring: `score = area*10 + distance_to_opponent*2 + straight_bonus + cycle_bonus + boost_penalty`. Deaths are very heavily penalized.
+
+### Pseudocode
+1. Read state, locate our head, compute `current_dir` and the Hamiltonian successor map.
+2. If the next cell on the cycle is free and not opposite to `current_dir`, follow it (no boost by default).
+3. Else, evaluate all non-opposite directions:
+    - Simulate occupying that next cell (and second step if boosting),
+    - If safe, compute reachable area via BFS and distance to opponent head (with torus),
+    - Add small straight and cycle continuity bonuses; penalize boost slightly.
+4. Choose the move with the highest score. Use BOOST only if its score beats the best non-boost by a clear margin.
+
+### Why This Works
+- The cycle provides a low-computation, high-coverage plan when uncontested.
+- The heuristic safely deviates when necessary to avoid traps and preserve future mobility.
+- Conservative boost policy reduces accidental over-commit into tight spaces.
+
+## SWOT Analysis
+
+### Strengths
+- High coverage: Serpentine cycle tends to visit all cells without crossing the trail.
+- Safe fallback: Flood-fill ensures we prefer moves that keep future options open.
+- Torus-aware: Correct handling of wrap-around for direction, distances, and reachability.
+- Modular design: Easy to tune scoring weights and swap components.
+
+### Weaknesses
+- Determinism can be exploited: A strong opponent may learn our cycle-following pattern.
+- Local heuristic: Flood-fill looks only one (or two with boost) steps ahead before area estimation; it’s not a full game tree search.
+- Boost conservatism: May miss rare opportunities where aggressive boosts create winning partitions.
+
+### Opportunities
+- Opponent modeling: Predict opponent head trajectory and penalize risky head-on lines more precisely.
+- Territory partitioning: Intentionally steer to split the board and secure a larger isolated region.
+- Adaptive boost policy: Detect long safe corridors and spend boosts to capitalize.
+- Caching: Memoize repeated flood-fill evaluations for identical local configurations.
+
+### Threats
+- Adversarial agents designed to break cycles early or force narrow corridors.
+- Time constraints: More sophisticated lookahead or RL policies risk timeouts under strict per-move limits.
+- Platform constraints: CPU-only libraries and Docker image limits restrict heavier models.
+
 #### `requirements.txt`
 **This file lists your agent's Python dependencies.**
 

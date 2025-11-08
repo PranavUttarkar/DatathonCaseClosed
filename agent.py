@@ -91,30 +91,25 @@ def send_move():
     player_number = request.args.get("player_number", default=1, type=int)
 
     with game_lock:
-        state = dict(LAST_POSTED_STATE)   
+        state = dict(LAST_POSTED_STATE)
         my_agent = GLOBAL_GAME.agent1 if player_number == 1 else GLOBAL_GAME.agent2
         boosts_remaining = my_agent.boosts_remaining
-   
-    # -----------------your code here-------------------
-    # Heuristic pathfinding agent:
-    # - Avoid immediate collisions (including with our own trail)
-    # - Prefer moves that maximize reachable empty space (flood fill)
-    # - Avoid reversing direction (judge will also fix this, but we pre-filter)
-    # - Consider using BOOST only when it increases safe reachable space and doesn't collide
 
-    from collections import deque
+    # -----------------your code here-------------------
+    # Modular, smarter agent combining Hamiltonian serpentine cycle following
+    # with flood-fill fallback and selective boost usage.
 
     board = state.get("board")
     my_trail = state.get("agent1_trail", []) if player_number == 1 else state.get("agent2_trail", [])
     opp_trail = state.get("agent2_trail", []) if player_number == 1 else state.get("agent1_trail", [])
+    turn_count = state.get("turn_count", 0)
 
     if not board or not my_trail:
         return jsonify({"move": "RIGHT"}), 200
 
-    height = len(board)
-    width = len(board[0]) if height > 0 else 0
+    H = len(board)
+    W = len(board[0]) if H > 0 else 0
 
-    # Direction helpers
     DIRS = {
         "UP": (0, -1),
         "DOWN": (0, 1),
@@ -124,7 +119,7 @@ def send_move():
     OPPOSITE = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
 
     def norm(x, y):
-        return (x % width, y % height)
+        return (x % W, y % H)
 
     def cell_empty(x, y, grid):
         nx, ny = norm(x, y)
@@ -133,7 +128,6 @@ def send_move():
         except Exception:
             return False
 
-    # Compute current direction from last 2 trail positions (torus-aware)
     def current_direction(trail):
         if len(trail) < 2:
             return "RIGHT"
@@ -141,15 +135,14 @@ def send_move():
         (x1, y1) = trail[-2]
         dx = x2 - x1
         dy = y2 - y1
-        # Adjust for torus wrapping: choose the step with |d| <= 1
         if dx > 1:
-            dx = dx - width
+            dx -= W
         if dx < -1:
-            dx = dx + width
+            dx += W
         if dy > 1:
-            dy = dy - height
+            dy -= H
         if dy < -1:
-            dy = dy + height
+            dy += H
         if (dx, dy) == (1, 0):
             return "RIGHT"
         if (dx, dy) == (-1, 0):
@@ -160,85 +153,124 @@ def send_move():
             return "UP"
         return "RIGHT"
 
-    # Flood-fill reachable area from a start on a given grid
+    def build_hamiltonian_successor(w, h):
+        succ = {}
+        for y in range(h):
+            if y % 2 == 0:
+                # even row: left to right
+                for x in range(w - 1):
+                    succ[(x, y)] = (x + 1, y)
+                # end of row, go down
+                succ[(w - 1, y)] = (w - 1, (y + 1) % h)
+            else:
+                # odd row: right to left
+                for x in range(w - 1, 0, -1):
+                    succ[(x, y)] = (x - 1, y)
+                # start of row, go down
+                succ[(0, y)] = (0, (y + 1) % h)
+        return succ
+
     def reachable_area(start_xy, grid):
+        from collections import deque
         sx, sy = norm(start_xy[0], start_xy[1])
         if not cell_empty(sx, sy, grid):
             return 0
-        seen = set()
-        q = deque()
-        q.append((sx, sy))
-        seen.add((sx, sy))
-        count = 0
+        seen = set([(sx, sy)])
+        q = deque([(sx, sy)])
+        cnt = 0
         while q:
             x, y = q.popleft()
-            count += 1
+            cnt += 1
             for dx, dy in DIRS.values():
                 nx, ny = norm(x + dx, y + dy)
                 if (nx, ny) not in seen and cell_empty(nx, ny, grid):
                     seen.add((nx, ny))
                     q.append((nx, ny))
-        return count
+        return cnt
 
-    # Score a move by simulating our immediate occupancy and measuring reachable area
     def score_move(dir_name, use_boost_flag):
         dx, dy = DIRS[dir_name]
-        head_x, head_y = my_trail[-1]
-        # First step
-        n1x, n1y = norm(head_x + dx, head_y + dy)
+        hx, hy = my_trail[-1]
+        # Step 1
+        n1x, n1y = norm(hx + dx, hy + dy)
         if not cell_empty(n1x, n1y, board):
-            return -1_000_000  # death
-        # Copy and mark first step as occupied
+            return -1_000_000
         g = [row[:] for row in board]
         g[n1y][n1x] = 1
-        # If boosting, second step in same dir
+        end_pos = (n1x, n1y)
+        # Step 2 if boosting
         if use_boost_flag:
             n2x, n2y = norm(n1x + dx, n1y + dy)
             if not cell_empty(n2x, n2y, g):
-                return -900_000  # death on boost second step
+                return -900_000
             g[n2y][n2x] = 1
-            start = (n2x, n2y)
-        else:
-            start = (n1x, n1y)
+            end_pos = (n2x, n2y)
 
-        # Primary metric: our reachable empty space after this move
-        area = reachable_area(start, g)
+        # Reachable space after move
+        area = reachable_area(end_pos, g)
 
-        # Secondary: prefer staying farther from opponent head to reduce head-on risks
+        # Distance from opponent head (torus manhattan) to reduce risky proximity
         opp_head = tuple(opp_trail[-1]) if opp_trail else None
         if opp_head:
             ox, oy = opp_head
-            # Manhattan distance with torus wrap
-            dxwrap = min((start[0] - ox) % width, (ox - start[0]) % width)
-            dywrap = min((start[1] - oy) % height, (oy - start[1]) % height)
+            dxwrap = min((end_pos[0] - ox) % W, (ox - end_pos[0]) % W)
+            dywrap = min((end_pos[1] - oy) % H, (oy - end_pos[1]) % H)
             dist = dxwrap + dywrap
         else:
             dist = 0
 
-        # Slightly reward continuing straight to avoid jitter
-        straight_bonus = 3 if dir_name == cur_dir else 0
+        # Cycle adherence bonus: prefer steps that go toward Hamiltonian successor
+        cyc_bonus = 0
+        if end_pos in hsucc:
+            # If our move puts us on a node whose successor is empty, encourage
+            next_on_cycle = hsucc[end_pos]
+            if cell_empty(*next_on_cycle, g):
+                cyc_bonus = 8
 
-        # Slightly penalize using boost unless it clearly helps area
+        straight_bonus = 3 if dir_name == cur_dir else 0
         boost_penalty = -2 if use_boost_flag else 0
 
-        return area * 10 + dist * 2 + straight_bonus + boost_penalty
+        return area * 10 + dist * 2 + straight_bonus + cyc_bonus + boost_penalty
 
+    # Build Hamiltonian successor mapping once per request
+    hsucc = build_hamiltonian_successor(W, H)
     cur_dir = current_direction(my_trail)
-    candidate_dirs = [d for d in DIRS.keys() if d != OPPOSITE.get(cur_dir, "")]  # avoid reversing
 
-    # Evaluate no-boost options first
+    # 1) Try to follow Hamiltonian cycle if the next cell is free
+    head = tuple(my_trail[-1])
+    if head in hsucc:
+        target = hsucc[head]
+        tx, ty = target
+        if cell_empty(tx, ty, board):
+            # Translate to direction (adjacent by construction)
+            dx = (tx - head[0]) % W
+            dy = (ty - head[1]) % H
+            # Convert wrap to -1/0/1 step
+            if dx == W - 1:
+                dx = -1
+            if dy == H - 1:
+                dy = -1
+            dir_from_vec = {(0, -1): "UP", (0, 1): "DOWN", (1, 0): "RIGHT", (-1, 0): "LEFT"}
+            dname = dir_from_vec.get((dx, dy))
+            if dname and dname != OPPOSITE.get(cur_dir, ""):
+                # Mostly avoid BOOST when on cycle to maintain coverage rhythm
+                return jsonify({"move": dname}), 200
+
+    # 2) Otherwise, evaluate candidate safe directions via scoring
+    candidates = [d for d in DIRS.keys() if d != OPPOSITE.get(cur_dir, "")]
     best = ("RIGHT", False, -1_000_000)
-    for dname in candidate_dirs:
-        s = score_move(dname, use_boost_flag=False)
+    for d in candidates:
+        s = score_move(d, use_boost_flag=False)
         if s > best[2]:
-            best = (dname, False, s)
+            best = (d, False, s)
 
-    # Consider boost if available; only keep if strictly better than non-boost
+    # Consider BOOST only if it clearly improves score and is safe
     if boosts_remaining > 0:
-        for dname in candidate_dirs:
-            s = score_move(dname, use_boost_flag=True)
-            if s > best[2] + 15:  # require clear improvement to justify boost
-                best = (dname, True, s)
+        for d in candidates:
+            s = score_move(d, use_boost_flag=True)
+            # Require a margin to compensate for risk and to avoid skipping cycle cells needlessly
+            if s > best[2] + 20:
+                best = (d, True, s)
 
     move = best[0] + (":BOOST" if best[1] else "")
     # -----------------end code here--------------------
