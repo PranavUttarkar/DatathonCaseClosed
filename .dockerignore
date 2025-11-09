@@ -1,5 +1,21 @@
-README.md
-local-tester.py
-sample_agent.py
-.git
+# Ignore local/host-specific and build artifacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# VCS and OS files
+.git/
 .gitignore
+.DS_Store
+Thumbs.db
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+
+# Optional: local scripts not needed in image (uncomment if desired)
+# local-tester.py
